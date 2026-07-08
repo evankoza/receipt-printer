@@ -26,4 +26,5 @@
 #define MAX_JOB_HEIGHT      2400 // ~30 cm of paper, matches relay limit
 #define STRIPE_ROWS         64   // rows per GS v 0 command
 #define BT_CHUNK            256  // bytes per BT write before yielding
-#define FEED_LINES_AFTER    6    // paper feed after each job (enough for the print to fully exit)
+#define FEED_LINES_AFTER    6    // legacy ESC d feed (this printer ignores it)
+#define FEED_RASTER_ROWS    40   // blank raster rows after each job (~0.5 cm at 203 dpi)

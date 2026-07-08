@@ -92,8 +92,20 @@ static bool btWriteAll(const uint8_t* data, size_t len) {
 }
 
 static bool feedPaper() {
-  uint8_t feed[] = {0x1B, 0x64, FEED_LINES_AFTER}; // ESC d n
-  return btWriteAll(feed, sizeof(feed));
+  // This printer ignores ESC d (feed n lines) just like it ignores the
+  // darkness commands — feed with blank raster rows via GS v 0 instead,
+  // the one command it demonstrably honors.
+  const uint16_t rows = FEED_RASTER_ROWS;
+  uint8_t hdr[8] = {
+    0x1D, 0x76, 0x30, 0x00,
+    (uint8_t)(PRINTER_WIDTH_BYTES & 0xFF), (uint8_t)(PRINTER_WIDTH_BYTES >> 8),
+    (uint8_t)(rows & 0xFF), (uint8_t)(rows >> 8)
+  };
+  if (!btWriteAll(hdr, sizeof(hdr))) return false;
+  uint8_t zeros[PRINTER_WIDTH_BYTES] = {0};
+  for (uint16_t y = 0; y < rows; y++)
+    if (!btWriteAll(zeros, sizeof(zeros))) return false;
+  return true;
 }
 
 // ---------- WebSocket ----------
