@@ -81,7 +81,10 @@ const jobStates = new Map();  // id -> 'queued'|'printing'|'done'|'error:msg'
 const CHUNK_ROWS = 64;
 
 function pump() {
-  if (active || !device || device.readyState !== 1 || queue.length === 0) return;
+  // hold jobs until the printer is actually reachable — dispatching while the
+  // BT link is down just makes the ESP32 fail the job ("printer offline")
+  if (active || !device || device.readyState !== 1 || !deviceStatus.printer ||
+      queue.length === 0) return;
   active = queue.shift();
   jobStates.set(active.id, 'printing');
   for (let y = 0; y < active.height; y += CHUNK_ROWS) {
@@ -138,8 +141,7 @@ app.post('/api/print', (req, res) => {
   if (!bits || bits.length !== WIDTH_BYTES * height)
     return res.status(400).json({ error: 'data length mismatch' });
 
-  if (!device || device.readyState !== 1)
-    return res.status(503).json({ error: 'Printer bridge is offline' });
+  // bridge/printer offline is fine — jobs wait in the queue and print on return
   if (queue.length >= MAX_QUEUE)
     return res.status(503).json({ error: 'Queue full, try again shortly' });
 
@@ -173,7 +175,7 @@ wss.on('connection', (ws, req) => {
     if (isBinary) return;
     let m;
     try { m = JSON.parse(msg.toString()); } catch { return; }
-    if (m.type === 'status') deviceStatus = m;
+    if (m.type === 'status') { deviceStatus = m; pump(); } // printer may have just come back
     else if (m.type === 'done' && active && m.id === active.id) finishActive(true);
     else if (m.type === 'error' && active && m.id === active.id) finishActive(false, m.message);
   });

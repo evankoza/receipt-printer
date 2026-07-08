@@ -483,29 +483,35 @@ $('printBtn').addEventListener('click', async () => {
 });
 
 async function watchJob(id) {
-  for (let i = 0; i < 60; i++) {
+  for (let i = 0; i < 150; i++) {  // ~5 min
     await new Promise(r => setTimeout(r, 2000));
     const res = await fetch(`${RELAY_URL}/api/job/${id}`).catch(() => null);
     if (!res || !res.ok) continue;
     const { state } = await res.json();
     if (state === 'done') { setMsg('✓ Printed! It is now physically on paper.', 'ok'); return; }
     if (state.startsWith('error')) { setMsg(`✗ ${state}`, 'err'); return; }
-    setMsg(state === 'printing' ? 'Printing…' : 'Queued…');
+    setMsg(state === 'printing' ? 'Printing…'
+      : printerReady ? 'Queued…'
+      : 'Queued — the printer is offline right now; it will print the moment it returns. Safe to close the page.');
   }
-  setMsg('Lost track of the job — check the printer.', 'err');
+  setMsg('Still queued — it will print when the printer comes back online.', 'ok');
 }
 
 // ---------- status pill ----------
+let printerReady = false;   // last polled bridge+printer state
 async function pollStatus() {
   const el = $('status');
   try {
     const res = await fetch(`${RELAY_URL}/api/status`);
     const s = await res.json();
-    const on = s.bridgeOnline && s.printerOnline;
-    el.innerHTML = `<span class="dot ${on ? 'on' : 'off'}"></span>` +
-      (on ? 'printer online' : s.bridgeOnline ? 'bridge up, printer off' : 'printer offline');
+    printerReady = s.bridgeOnline && s.printerOnline;
+    el.innerHTML = `<span class="dot ${printerReady ? 'on' : 'off'}"></span>` +
+      (printerReady ? 'printer online' : s.bridgeOnline ? 'bridge up, printer off' : 'printer offline');
+    $('offlineNote').hidden = printerReady;
   } catch {
+    printerReady = false;
     el.innerHTML = '<span class="dot off"></span>relay unreachable';
+    $('offlineNote').hidden = true; // relay down: queueing isn't possible either
   }
 }
 pollStatus();

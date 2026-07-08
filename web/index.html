@@ -100,6 +100,11 @@
   #paperGrip:hover { color: var(--accent); border-color: var(--accent); }
   #msg { min-height: 18px; font-size: 13px; color: var(--muted); }
   #msg.err { color: #ff7a7a; } #msg.ok { color: #5ad66f; }
+  #offlineNote {
+    font-size: 13px; color: var(--accent); background: rgba(255, 180, 84, .08);
+    border: 1px solid rgba(255, 180, 84, .35); border-radius: 6px;
+    padding: 10px 12px; margin-bottom: 12px;
+  }
 </style>
 </head>
 <body>
@@ -182,6 +187,11 @@
     </section>
 
     <section>
+      <div id="offlineNote" hidden>
+        🧻 The printer looks offline — it probably ran out of paper (or someone tripped
+        over a cable). Any prints you send now are queued and will print the moment
+        it's back online.
+      </div>
       <button id="printBtn" class="primary">🖨 Print it</button>
       <div id="msg"></div>
     </section>
