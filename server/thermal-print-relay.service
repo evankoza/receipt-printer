@@ -1,0 +1,18 @@
+[Unit]
+Description=Thermal print relay (browser <-> ESP32 print bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/thermal-print-relay
+Environment=PORT=8377
+Environment=DEVICE_TOKEN=CHANGE_ME_openssl_rand_hex_24
+Environment=ALLOWED_ORIGINS=https://evankoza.com,https://www.evankoza.com
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

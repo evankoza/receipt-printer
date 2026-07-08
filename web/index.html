@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Receipt Printer — evankoza.com</title>
+<style>
+  :root {
+    --bg: #16181d; --panel: #1f2229; --panel2: #262a33; --text: #e8e8e8;
+    --muted: #9aa0ab; --accent: #ffb454; --border: #343946;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header {
+    padding: 14px 20px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 18px; margin: 0; }
+  header .sub { color: var(--muted); font-size: 13px; }
+  #status { margin-left: auto; font-size: 13px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%;
+         background: #777; margin-right: 6px; vertical-align: baseline; }
+  .dot.on { background: #5ad66f; } .dot.off { background: #e05555; }
+
+  main { display: flex; gap: 18px; padding: 18px; align-items: flex-start; flex-wrap: wrap; }
+
+  /* ---- preview column ---- */
+  #previewCol { flex: 0 0 auto; }
+  #paperWrap {
+    background: #0d0e11; border: 1px solid var(--border); border-radius: 8px;
+    padding: 16px 16px 24px; /* extra bottom room for the resize grip */
+  }
+  #paper {
+    position: relative; width: 384px; background: #fdfdf8;
+    box-shadow: 0 4px 24px rgba(0,0,0,.5); touch-action: none;
+  }
+  #paper canvas { display: block; width: 384px; image-rendering: pixelated; }
+  #overlay { position: absolute; inset: 0; }
+  .selbox { position: absolute; border: 1.5px dashed #2b7de9; pointer-events: none; }
+  .selbox .handle {
+    position: absolute; right: -7px; bottom: -7px; width: 14px; height: 14px;
+    background: #2b7de9; border-radius: 3px; pointer-events: auto; cursor: nwse-resize;
+  }
+  #previewMeta { color: var(--muted); font-size: 12px; margin-top: 8px; text-align: center; }
+
+  /* ---- controls column ---- */
+  #controls { flex: 1 1 340px; min-width: 320px; max-width: 480px;
+              display: flex; flex-direction: column; gap: 14px; }
+  section {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  section h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+               color: var(--muted); margin: 0 0 10px; }
+  .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
+  .row label { min-width: 86px; color: var(--muted); font-size: 13px; }
+  .row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .row output { min-width: 38px; text-align: right; font-variant-numeric: tabular-nums; }
+  select, input[type=text], input[type=number], textarea, button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 7px 10px; font: inherit;
+  }
+  textarea { width: 100%; resize: vertical; }
+  button { cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button.primary {
+    background: var(--accent); color: #1a1205; font-weight: 600; border: none;
+    padding: 10px 18px; font-size: 15px; width: 100%;
+  }
+  button.primary:disabled { opacity: .5; cursor: not-allowed; }
+  button.danger { color: #ff7a7a; }
+  #elementList { display: flex; flex-direction: column; gap: 6px; }
+  .elItem {
+    display: flex; align-items: center; gap: 8px; padding: 6px 8px;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; font-size: 13px;
+  }
+  .elItem.selected { border-color: var(--accent); }
+  .elItem .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .elItem .grip { color: var(--muted); cursor: grab; user-select: none; }
+  .elItem .del {
+    border: none; background: none; color: var(--muted); padding: 2px 6px;
+    font-size: 15px; line-height: 1; border-radius: 4px;
+  }
+  .elItem .del:hover { color: #ff7a7a; background: rgba(255,122,122,.12); }
+  .elItem.dragging { opacity: .45; }
+  .elItem.dropAbove { box-shadow: 0 -2px 0 var(--accent); }
+  .elItem.dropBelow { box-shadow: 0 2px 0 var(--accent); }
+  #layersHint { color: var(--muted); font-size: 11px; margin: 2px 0 6px; }
+  #paperGrip {
+    position: absolute; left: 0; right: 0; bottom: -18px; height: 18px;
+    background: var(--panel2); border: 1px solid var(--border); border-top: none;
+    border-radius: 0 0 8px 8px; cursor: ns-resize; text-align: center;
+    color: var(--muted); font-size: 12px; line-height: 14px; user-select: none;
+    touch-action: none;
+  }
+  #paperGrip:hover { color: var(--accent); border-color: var(--accent); }
+  #msg { min-height: 18px; font-size: 13px; color: var(--muted); }
+  #msg.err { color: #ff7a7a; } #msg.ok { color: #5ad66f; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🧾 Receipt Printer</h1>
+  <span class="sub">prints on a real thermal printer in my house</span>
+  <span id="status"><span class="dot"></span>checking…</span>
+</header>
+
+<main>
+  <div id="previewCol">
+    <div id="paperWrap">
+      <div id="paper">
+        <canvas id="preview" width="384" height="400"></canvas>
+        <div id="overlay"></div>
+        <div id="paperGrip" title="Drag to change paper length">⋯</div>
+      </div>
+    </div>
+    <div id="previewMeta"></div>
+  </div>
+
+  <div id="controls">
+    <section>
+      <h2>Add content</h2>
+      <div class="row">
+        <button id="addText">＋ Text</button>
+        <button id="addImage">＋ Image</button>
+        <input type="file" id="imageFile" accept="image/*" hidden>
+        <span style="flex:1"></span>
+        <button id="fitHeight" title="Shrink/grow the paper to fit the content">Fit paper</button>
+      </div>
+      <div id="layersHint">Layers — drag to reorder (top = printed on top)</div>
+      <div id="elementList"></div>
+    </section>
+
+    <section id="elProps" hidden>
+      <h2>Selected element</h2>
+      <div id="textProps" hidden>
+        <div class="row"><textarea id="textContent" rows="2" placeholder="Your text…"></textarea></div>
+        <div class="row">
+          <label>Font</label>
+          <select id="textFont">
+            <option value="monospace">Mono</option>
+            <option value="system-ui, sans-serif">Sans</option>
+            <option value="Georgia, serif">Serif</option>
+            <option value="'Comic Sans MS', cursive">Comic</option>
+          </select>
+          <select id="textAlign">
+            <option value="left">Left</option><option value="center">Center</option><option value="right">Right</option>
+          </select>
+          <label style="min-width:auto"><input type="checkbox" id="textBold"> Bold</label>
+        </div>
+        <div class="row"><label>Size</label><input type="range" id="textSize" min="10" max="96" value="24"><output>24</output></div>
+      </div>
+      <div id="imageProps" hidden>
+        <div class="row"><label>Scale</label><input type="range" id="imgScale" min="5" max="200" value="100"><output>100</output></div>
+      </div>
+      <div class="row"><button id="deleteEl" class="danger">Delete element</button></div>
+    </section>
+
+    <section>
+      <h2>Print style</h2>
+      <div class="row">
+        <label>Dither</label>
+        <select id="dither">
+          <option value="floyd">Floyd–Steinberg</option>
+          <option value="atkinson">Atkinson</option>
+          <option value="bayer4">Bayer 4×4</option>
+          <option value="bayer8">Bayer 8×8</option>
+          <option value="halftone">Halftone dots</option>
+          <option value="crosshatch">Crosshatch</option>
+          <option value="threshold">Plain threshold</option>
+        </select>
+      </div>
+      <div class="row"><label>Brightness</label><input type="range" id="brightness" min="-100" max="100" value="0"><output>0</output></div>
+      <div class="row"><label>Contrast</label><input type="range" id="contrast" min="-100" max="100" value="0"><output>0</output></div>
+      <div class="row"><label>Threshold</label><input type="range" id="threshold" min="1" max="254" value="128"><output>128</output></div>
+      <div class="row" id="cellRow"><label>Pattern size</label><input type="range" id="cellSize" min="3" max="12" value="6"><output>6</output></div>
+      <div class="row"><label style="min-width:auto"><input type="checkbox" id="invert"> Invert</label></div>
+    </section>
+
+    <section>
+      <button id="printBtn" class="primary">🖨 Print it</button>
+      <div id="msg"></div>
+    </section>
+  </div>
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

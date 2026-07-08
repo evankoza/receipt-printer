@@ -1,0 +1,14 @@
+{
+  "name": "thermal-print-relay",
+  "version": "1.0.0",
+  "description": "Relay between the web print editor and the ESP32 print bridge",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "ws": "^8.17.0"
+  }
+}

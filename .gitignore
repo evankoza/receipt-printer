@@ -1,0 +1,10 @@
+# secrets — copy config.example.h to config.h and fill in
+firmware/src/config.h
+
+# build artifacts / deps
+firmware/.pio/
+server/node_modules/
+server/package-lock.json
+
+# local tooling
+.claude/
