@@ -58,33 +58,37 @@ static bool connectPrinter() {
   return false;
 }
 
-// Write to BT in small chunks, yielding so WiFi/WS stay alive.
-static bool btWriteAll(const uint8_t* data, size_t len) {
-  size_t sent = 0;
-  while (sent < len) {
-    if (!bt.connected()) return false;
-    size_t n = min((size_t)BT_CHUNK, len - sent);
-    size_t w = bt.write(data + sent, n);
-    if (w == 0) { delay(20); continue; }
-    sent += w;
-    delay(2); // pace SPP; printer buffer is small
-  }
-  return true;
+// ---------- job buffer ----------
+// Chunks are buffered here and drained to BT from loop(), a little per pass.
+// Printing inline in the WS callback blocks ws.loop() for the whole job
+// (SPP drains at printer speed), the heartbeat misses and the relay drops
+// mid-print — which over the TLS funnel costs a reboot and a requeue loop.
+#define JOB_BUF_ROWS 420  // relay caps jobs at 400 rows
+// Allocated on the heap AFTER the BT stack is up: as a static array it shrank
+// the heap enough that BT controller init null-crashed (StoreProhibited).
+static uint8_t* jobBuf = nullptr;
+static size_t jobLen = 0;       // bytes buffered
+static size_t jobSent = 0;      // bytes already handed to BT (incl. headers logic below)
+static uint16_t rowsBuffered = 0;
+static uint16_t rowsSent = 0;   // rows fully dispatched to BT
+static bool jobEndSeen = false;
+static uint32_t jobEndId = 0;
+
+// One bounded BT write; returns bytes accepted (0 = queue full, try later).
+static size_t btTryWrite(const uint8_t* data, size_t len) {
+  if (!bt.connected()) return 0;
+  return bt.write(data, min(len, (size_t)BT_CHUNK));
 }
 
-static bool printBitmap(const uint8_t* bits, uint16_t widthBytes, uint16_t height) {
-  // Send in stripes: GS v 0 m=0, xL xH yL yH, data
-  for (uint16_t y = 0; y < height; y += STRIPE_ROWS) {
-    uint16_t rows = min((uint16_t)STRIPE_ROWS, (uint16_t)(height - y));
-    uint8_t hdr[8] = {
-      0x1D, 0x76, 0x30, 0x00,
-      (uint8_t)(widthBytes & 0xFF), (uint8_t)(widthBytes >> 8),
-      (uint8_t)(rows & 0xFF), (uint8_t)(rows >> 8)
-    };
-    if (!btWriteAll(hdr, sizeof(hdr))) return false;
-    if (!btWriteAll(bits + (size_t)y * widthBytes, (size_t)rows * widthBytes)) return false;
+// Write a small buffer, retrying briefly (headers/feeds only — a few bytes).
+static bool btWriteAll(const uint8_t* data, size_t len) {
+  size_t sent = 0;
+  for (int tries = 0; sent < len && tries < 200; tries++) {
+    if (!bt.connected()) return false;
+    size_t w = bt.write(data + sent, len - sent);
+    if (w == 0) delay(10); else sent += w;
   }
-  return true;
+  return sent == len;
 }
 
 static bool feedPaper() {
@@ -116,6 +120,7 @@ static void failJob(uint32_t jobId, const char* why) {
   failReason = why;
 }
 
+// Buffer the chunk; actual BT output happens in drainJob() from loop().
 static void handleChunk(uint8_t* payload, size_t length) {
   if (length < 8) return;
   uint16_t widthBytes = payload[0] | (payload[1] << 8);
@@ -133,29 +138,82 @@ static void handleChunk(uint8_t* payload, size_t length) {
     failJob(jobId, "printer offline");
     return;
   }
-  Serial.printf("Printing job %u chunk (%u rows)\n", jobId, rows);
-  lastChunkMs = millis();
-  currentJobId = jobId;
-  if (!printBitmap(payload + 8, widthBytes, rows)) {
-    printerConnected = false;
-    failJob(jobId, "bluetooth write failed");
+  if (jobId != currentJobId) { // new job starts
+    currentJobId = jobId;
+    jobLen = jobSent = 0; rowsBuffered = rowsSent = 0; jobEndSeen = false;
   }
+  if (!jobBuf || rowsBuffered + rows > JOB_BUF_ROWS) {
+    failJob(jobId, !jobBuf ? "no job buffer" : "job too tall for buffer");
+    return;
+  }
+  Serial.printf("Buffering job %u chunk (%u rows)\n", jobId, rows);
+  memcpy(jobBuf + jobLen, payload + 8, (size_t)widthBytes * rows);
+  jobLen += (size_t)widthBytes * rows;
+  rowsBuffered += rows;
+  lastChunkMs = millis();
+}
+
+static void finishJob(uint32_t jobId, bool ok, const char* why) {
+  JsonDocument reply;
+  reply["id"] = jobId;
+  if (ok) { reply["type"] = "done"; jobsDone++; }
+  else    { reply["type"] = "error"; reply["message"] = why; jobsFailed++; }
+  lastChunkMs = 0;
+  jobLen = jobSent = 0; rowsBuffered = rowsSent = 0; jobEndSeen = false;
+  currentJobId = 0;
+  if (ws.isConnected()) sendJson(reply);
 }
 
 static void handleJobEnd(uint32_t jobId) {
-  JsonDocument reply;
-  reply["id"] = jobId;
-  if (jobId == failedJobId) {
-    reply["type"] = "error";
-    reply["message"] = failReason;
-    jobsFailed++;
-  } else {
-    feedPaper();
-    reply["type"] = "done";
-    jobsDone++;
+  if (jobId == failedJobId) { finishJob(jobId, false, failReason); return; }
+  jobEndSeen = true;
+  jobEndId = jobId;   // finishJob happens in drainJob() once all rows are out
+}
+
+// Called every loop() pass: push at most one stripe header + pending bytes
+// to BT without ever busy-waiting, so ws.loop() keeps the connection alive.
+static void drainJob() {
+  if (jobLen == 0 || rowsSent >= rowsBuffered) {
+    if (jobEndSeen && jobLen > 0 && rowsSent >= rowsBuffered) {
+      bool ok = feedPaper();
+      finishJob(jobEndId, ok, "bluetooth write failed");
+    }
+    return;
   }
-  lastChunkMs = 0;
-  sendJson(reply);
+  if (!bt.connected()) {
+    printerConnected = false;
+    failJob(currentJobId, "bluetooth write failed");
+    finishJob(currentJobId, false, failReason);
+    return;
+  }
+
+  // stripe bookkeeping: emit a GS v 0 header at each stripe boundary
+  static uint16_t stripeRowsLeft = 0;   // rows remaining in the open stripe
+  static size_t   stripeBytesLeft = 0;  // data bytes remaining in the open stripe
+
+  if (stripeBytesLeft == 0) {
+    if (rowsSent >= rowsBuffered) return;
+    uint16_t rows = min((uint16_t)STRIPE_ROWS, (uint16_t)(rowsBuffered - rowsSent));
+    // don't start a stripe we don't have full data for unless jobEnd arrived
+    if (!jobEndSeen && rows < STRIPE_ROWS) return;
+    uint8_t hdr[8] = {
+      0x1D, 0x76, 0x30, 0x00,
+      (uint8_t)(PRINTER_WIDTH_BYTES & 0xFF), (uint8_t)(PRINTER_WIDTH_BYTES >> 8),
+      (uint8_t)(rows & 0xFF), (uint8_t)(rows >> 8)
+    };
+    if (!btWriteAll(hdr, sizeof(hdr))) return; // retry next pass
+    stripeRowsLeft = rows;
+    stripeBytesLeft = (size_t)rows * PRINTER_WIDTH_BYTES;
+    lastChunkMs = millis();
+  }
+
+  size_t w = btTryWrite(jobBuf + jobSent, stripeBytesLeft);
+  if (w > 0) {
+    jobSent += w;
+    stripeBytesLeft -= w;
+    lastChunkMs = millis();
+    if (stripeBytesLeft == 0) { rowsSent += stripeRowsLeft; stripeRowsLeft = 0; }
+  }
 }
 
 static void wsEvent(WStype_t type, uint8_t* payload, size_t length) {
@@ -203,10 +261,22 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi connecting");
+  uint32_t wifiStart = millis(), lastKick = millis();
   while (WiFi.status() != WL_CONNECTED) {
     delay(50); displayBoot("joining " WIFI_SSID);
     static uint32_t lastDot = 0;
     if (millis() - lastDot > 300) { lastDot = millis(); Serial.print("."); }
+    // The join sometimes wedges (dot loop) — kick a fresh attempt every 15 s
+    // and hard-reboot after 90 s rather than hang forever.
+    if (millis() - lastKick > 15000) {
+      lastKick = millis();
+      Serial.print("(retry)");
+      WiFi.disconnect(true);
+      delay(200);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    }
+    if (millis() - wifiStart > 90000) { Serial.println("\nWiFi stuck 90s, rebooting"); ESP.restart(); }
   }
   Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
 
@@ -215,7 +285,9 @@ void setup() {
   else               ws.begin(RELAY_HOST, RELAY_PORT, path);
   ws.onEvent(wsEvent);
   ws.setReconnectInterval(5000);
-  ws.enableHeartbeat(15000, 5000, 3);
+  // Generous pong timeout: the Tailscale Funnel path can be slow and we'd
+  // rather tolerate latency than drop (a drop costs a full reboot, see loop).
+  ws.enableHeartbeat(25000, 12000, 5);
 }
 
 static bool btUp = false;
@@ -230,19 +302,22 @@ void loop() {
     bt.begin("ESP32-PrintBridge", true); // true = master (we connect out)
     bt.setPin(PRINTER_PIN);
     btUp = true;
+    jobBuf = (uint8_t*)malloc((size_t)JOB_BUF_ROWS * PRINTER_WIDTH_BYTES);
+    Serial.printf("BT up, job buffer %s (heap %u)\n", jobBuf ? "ok" : "ALLOC FAILED", ESP.getFreeHeap());
   }
 
   // With BT running the TLS re-handshake can't allocate — reboot to recover.
   if (btUp) {
     if (ws.isConnected()) relayDownSince = 0;
     else if (!relayDownSince) relayDownSince = millis();
-    else if (millis() - relayDownSince > 60000) {
-      Serial.println("Relay down >60s with BT active, rebooting");
+    else if (millis() - relayDownSince > 20000) {
+      Serial.println("Relay down >20s with BT active, rebooting");
       ESP.restart();
     }
   }
 
   printerConnected = btUp && bt.connected();
+  if (printerConnected) drainJob();
   if (btUp && !printerConnected && millis() - lastPrinterAttempt > 15000) {
     lastPrinterAttempt = millis();
     printerConnected = connectPrinter();
