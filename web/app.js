@@ -3,7 +3,7 @@
 
 const RELAY_URL =
   ['localhost', '127.0.0.1'].includes(location.hostname) ? 'http://localhost:8377' // local dev
-  : location.hostname.endsWith('evankoza.com') ? 'https://kohzuhserver.tail2b2f49.ts.net' // GitHub Pages -> home server (Tailscale Funnel)
+  : location.hostname.endsWith('evankoza.com') ? 'https://cargo-deutschland-ten-precipitation.trycloudflare.com' // GitHub Pages -> laptop relay (Cloudflare quick tunnel)
   : '';                                    // page served by the relay itself (tunnel): same origin
 
 const W = 384;
