@@ -16,6 +16,7 @@
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
 #include "config.h"
+#include "display.h"
 
 BluetoothSerial bt;
 WebSocketsClient ws;
@@ -23,6 +24,12 @@ WebSocketsClient ws;
 static bool printerConnected = false;
 static uint32_t lastPrinterAttempt = 0;
 static uint32_t lastStatusSent = 0;
+
+// dashboard counters
+static uint32_t jobsDone = 0;
+static uint32_t jobsFailed = 0;
+static uint32_t lastChunkMs = 0;   // chunks flowing -> "printing" on the OLED
+static uint32_t currentJobId = 0;
 
 // ---------- Bluetooth / printer ----------
 
@@ -126,6 +133,8 @@ static void handleChunk(uint8_t* payload, size_t length) {
     return;
   }
   Serial.printf("Printing job %u chunk (%u rows)\n", jobId, rows);
+  lastChunkMs = millis();
+  currentJobId = jobId;
   if (!printBitmap(payload + 8, widthBytes, rows)) {
     printerConnected = false;
     failJob(jobId, "bluetooth write failed");
@@ -138,10 +147,13 @@ static void handleJobEnd(uint32_t jobId) {
   if (jobId == failedJobId) {
     reply["type"] = "error";
     reply["message"] = failReason;
+    jobsFailed++;
   } else {
     feedPaper();
     reply["type"] = "done";
+    jobsDone++;
   }
+  lastChunkMs = 0;
   sendJson(reply);
 }
 
@@ -177,13 +189,19 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  displayInit();
+
   bt.begin("ESP32-PrintBridge", true); // true = master (we connect out)
   bt.setPin(PRINTER_PIN);
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(50); displayBoot("joining " WIFI_SSID);
+    static uint32_t lastDot = 0;
+    if (millis() - lastDot > 300) { lastDot = millis(); Serial.print("."); }
+  }
   Serial.printf("\nWiFi: %s\n", WiFi.localIP().toString().c_str());
 
   String path = String(RELAY_PATH) + "?token=" + DEVICE_TOKEN;
@@ -207,4 +225,17 @@ void loop() {
     lastStatusSent = millis();
     if (ws.isConnected()) sendStatus();
   }
+
+  static String ipStr;
+  ipStr = WiFi.localIP().toString();
+  BridgeState st;
+  st.wifiUp = WiFi.status() == WL_CONNECTED;
+  st.ip = ipStr.c_str();
+  st.relayUp = ws.isConnected();
+  st.printerUp = printerConnected;
+  st.jobsDone = jobsDone;
+  st.jobsFailed = jobsFailed;
+  st.printing = lastChunkMs && millis() - lastChunkMs < 3000;
+  st.printingJob = currentJobId;
+  displayTick(st);
 }
