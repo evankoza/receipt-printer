@@ -1,9 +1,10 @@
 // Receipt editor: compose text/images on a 384px-wide canvas, dither it,
 // and POST the packed 1-bit bitmap to the print relay.
 
-const RELAY_URL = ['localhost', '127.0.0.1'].includes(location.hostname)
-  ? 'http://localhost:8377'              // local dev: relay on this machine
-  : 'https://print.evankoza.com';        // production relay
+const RELAY_URL =
+  ['localhost', '127.0.0.1'].includes(location.hostname) ? 'http://localhost:8377' // local dev
+  : location.hostname.endsWith('evankoza.com') ? 'https://print.evankoza.com'      // GitHub Pages
+  : '';                                    // page served by the relay itself (tunnel): same origin
 
 const W = 384;
 const preview = document.getElementById('preview');

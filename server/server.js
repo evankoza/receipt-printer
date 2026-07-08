@@ -10,6 +10,9 @@ import express from 'express';
 import http from 'http';
 import { WebSocketServer } from 'ws';
 import crypto from 'crypto';
+import path from 'path';
+import fs from 'fs';
+import { fileURLToPath } from 'url';
 
 const PORT = process.env.PORT || 8377;
 const DEVICE_TOKEN = process.env.DEVICE_TOKEN || 'CHANGE_ME_LONG_RANDOM_STRING';
@@ -38,6 +41,12 @@ app.use((req, res, next) => {
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
+
+// Serve the editor itself if web/ is present next to server/ — handy for
+// tunnels and for running the whole demo off one process. Same-origin, so
+// the browser needs no CORS for this case.
+const webDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'web');
+if (fs.existsSync(webDir)) app.use(express.static(webDir));
 
 // ---- rate limiting (in-memory, fine for a hobby relay) ----
 const hits = new Map(); // ip -> [timestamps]
