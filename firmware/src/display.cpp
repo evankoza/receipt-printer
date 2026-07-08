@@ -12,21 +12,34 @@ static const uint16_t C_ACCENT = 0xCA80;   // #C95000 pumpkin
 static const uint16_t C_OK     = 0x2E64;   // green
 static const uint16_t C_BAD    = 0xC945;   // red
 
-// landscape layout: 320 wide, 170 tall
-static const int16_t ROW_X = 12, ROW_W = 296;
-static const int16_t ROW_Y[3] = { 44, 78, 112 };
-static const int16_t ROW_H = 30;
-static const int16_t FOOT_Y = 148;
+// The panel hides ~40 px behind the bezel on every side (same as ChessBot),
+// so the whole dashboard lives in a centred safe area. Tune SAFE_* if the
+// bezel still clips.
+static const int16_t SAFE_X = 40, SAFE_Y = 40;
+static const int16_t SAFE_W = 320 - 2 * SAFE_X;   // 240
+static const int16_t SAFE_H = 170 - 2 * SAFE_Y;   // 90
+
+// compact layout, font 2 (16 px): title, three rows, footer
+static const int16_t TITLE_Y  = SAFE_Y;
+static const int16_t ROW_Y0   = SAFE_Y + 20;
+static const int16_t ROW_STEP = 17;
+static const int16_t FOOT_Y   = SAFE_Y + 74;
+static const int16_t DOT_X    = SAFE_X + 62;
+static const int16_t DETAIL_X = SAFE_X + 76;
+
+static void drawHeader() {
+  tft.setTextFont(2);
+  tft.setTextColor(C_ACCENT, C_BG);
+  tft.setCursor(SAFE_X, TITLE_Y);
+  tft.print("PRINT BRIDGE");
+  tft.drawFastHLine(SAFE_X, TITLE_Y + 17, SAFE_W, C_PANEL);
+}
 
 void displayInit() {
   tft.init();
-  tft.setRotation(3);
+  tft.setRotation(1);   // flipped landscape (USB on the other side)
   tft.fillScreen(C_BG);
-  tft.setTextFont(4);
-  tft.setTextColor(C_ACCENT, C_BG);
-  tft.setCursor(ROW_X, 8);
-  tft.print("PRINT BRIDGE");
-  tft.drawFastHLine(0, 36, 320, C_PANEL);
+  drawHeader();
 }
 
 static const char SPIN[] = { '|', '/', '-', '\\' };
@@ -35,37 +48,37 @@ void displayBoot(const char* line) {
   static uint32_t lastDraw = 0;
   if (millis() - lastDraw < 150) return;
   lastDraw = millis();
-  tft.setTextFont(4);
+  tft.setTextFont(2);
   tft.setTextColor(C_TEXT, C_BG);
-  tft.setCursor(ROW_X, ROW_Y[0]);
+  tft.setCursor(SAFE_X, ROW_Y0);
   tft.print(line);
   tft.setTextColor(C_ACCENT, C_BG);
-  tft.setCursor(ROW_X + tft.textWidth(line) + 12, ROW_Y[0]);
+  tft.setCursor(SAFE_X + tft.textWidth(line) + 8, ROW_Y0);
   tft.print(SPIN[(millis() / 150) & 3]);
 }
 
 // one status row: label, colored state dot, detail text
 static void row(uint8_t i, const char* label, bool ok, const char* detail) {
-  int16_t y = ROW_Y[i];
-  tft.fillRect(ROW_X, y, ROW_W, ROW_H, C_BG);
-  tft.setTextFont(4);
+  int16_t y = ROW_Y0 + i * ROW_STEP;
+  tft.fillRect(SAFE_X, y, SAFE_W, ROW_STEP, C_BG);
+  tft.setTextFont(2);
   tft.setTextColor(C_MUTED, C_BG);
-  tft.setCursor(ROW_X, y);
+  tft.setCursor(SAFE_X, y);
   tft.print(label);
-  tft.fillSmoothCircle(118, y + 11, 7, ok ? C_OK : C_BAD, C_BG);
+  tft.fillSmoothCircle(DOT_X, y + 7, 4, ok ? C_OK : C_BAD, C_BG);
   tft.setTextColor(C_TEXT, C_BG);
-  tft.setCursor(138, y);
+  tft.setCursor(DETAIL_X, y);
   tft.print(detail);
 }
 
 static void footer(const char* left, const char* right, uint16_t rightColor) {
-  tft.fillRect(0, FOOT_Y - 4, 320, 170 - (FOOT_Y - 4), C_PANEL);
+  tft.fillRect(SAFE_X, FOOT_Y - 2, SAFE_W, 18, C_PANEL);
   tft.setTextFont(2);
   tft.setTextColor(C_MUTED, C_PANEL);
-  tft.setCursor(ROW_X, FOOT_Y);
+  tft.setCursor(SAFE_X + 4, FOOT_Y);
   tft.print(left);
   tft.setTextColor(rightColor, C_PANEL);
-  tft.setCursor(320 - ROW_X - tft.textWidth(right), FOOT_Y);
+  tft.setCursor(SAFE_X + SAFE_W - 4 - tft.textWidth(right), FOOT_Y);
   tft.print(right);
 }
 
@@ -81,11 +94,7 @@ void displayTick(const BridgeState& s) {
   if (first) {
     // boot screen leftovers off, header back on
     tft.fillScreen(C_BG);
-    tft.setTextFont(4);
-    tft.setTextColor(C_ACCENT, C_BG);
-    tft.setCursor(ROW_X, 8);
-    tft.print("PRINT BRIDGE");
-    tft.drawFastHLine(0, 36, 320, C_PANEL);
+    drawHeader();
   }
 
   if (first || s.wifiUp != prev.wifiUp || strcmp(s.wifiUp ? s.ip : "", prevIp) != 0) {
@@ -100,10 +109,10 @@ void displayTick(const BridgeState& s) {
   // footer: job counters left; activity / uptime right (redraw when text changes)
   static char prevFoot[48] = "";
   char left[24], right[24], both[48];
-  snprintf(left, sizeof(left), "jobs %lu   failed %lu",
+  snprintf(left, sizeof(left), "jobs %lu  fail %lu",
            (unsigned long)s.jobsDone, (unsigned long)s.jobsFailed);
   if (s.printing) {
-    snprintf(right, sizeof(right), "%c printing #%lu",
+    snprintf(right, sizeof(right), "%c print #%lu",
              SPIN[(millis() / 150) & 3], (unsigned long)s.printingJob);
   } else {
     uint32_t up = millis() / 1000;
