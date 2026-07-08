@@ -7,6 +7,7 @@ const RELAY_URL =
   : '';                                    // page served by the relay itself (tunnel): same origin
 
 const W = 384;
+const MAX_H = 400;   // rows: ~5 cm at 203 dpi — must match the relay's MAX_HEIGHT
 const preview = document.getElementById('preview');
 const pctx = preview.getContext('2d');
 const overlay = document.getElementById('overlay');
@@ -365,14 +366,15 @@ for (const id of ['dither', 'brightness', 'contrast', 'threshold', 'cellSize', '
 $('cellRow').style.display = 'none';
 
 function setPaperH(h) {
-  paperH = Math.max(100, Math.min(2400, Math.round(h / 8) * 8));
+  paperH = Math.max(100, Math.min(MAX_H, Math.round(h / 8) * 8));
   render();
 }
-$('fitHeight').addEventListener('click', () => {
+function fitPaper() {
   let maxY = 100;
   for (const el of elements) { const b = elBounds(el); maxY = Math.max(maxY, b.y + b.h); }
   setPaperH(maxY + 16);
-});
+}
+$('fitHeight').addEventListener('click', fitPaper);
 
 // drag the grip below the paper to change its length
 $('paperGrip').addEventListener('pointerdown', e => {
@@ -455,15 +457,19 @@ const msg = $('msg');
 function setMsg(text, cls = '') { msg.textContent = text; msg.className = cls; }
 
 $('printBtn').addEventListener('click', async () => {
-  if (!latestBits) return;
   const btn = $('printBtn');
   btn.disabled = true;
   setMsg('Sending…');
   try {
+    // snap the paper to the content so we never print trailing blank roll
+    // (also updates the preview via the queued render)
+    fitPaper();
+    const bits = ditherToBits();   // synchronous, uses the fitted paperH
+    latestBits = bits;
     const res = await fetch(`${RELAY_URL}/api/print`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ width: W, height: paperH, data: packBits(latestBits) }),
+      body: JSON.stringify({ width: W, height: paperH, data: packBits(bits) }),
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);

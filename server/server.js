@@ -22,7 +22,7 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
 
 const WIDTH_DOTS = 384;
 const WIDTH_BYTES = WIDTH_DOTS / 8;
-const MAX_HEIGHT = 2400;          // rows (~30 cm of paper)
+const MAX_HEIGHT = 400;           // rows (~5 cm of paper — public page, save the roll)
 const MAX_QUEUE = 10;
 const JOB_TIMEOUT_MS = 180_000; // max-length job + slow-burn pauses can near 2 min
 const RATE_LIMIT = { windowMs: 60_000, max: 3 }; // per IP: 3 prints/minute
