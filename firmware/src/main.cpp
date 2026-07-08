@@ -12,6 +12,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_bt.h>
 #include <BluetoothSerial.h>
 #include <WebSocketsClient.h>
 #include <ArduinoJson.h>
@@ -191,8 +192,13 @@ void setup() {
 
   displayInit();
 
-  bt.begin("ESP32-PrintBridge", true); // true = master (we connect out)
-  bt.setPin(PRINTER_PIN);
+  // BT Classic only — release the BLE half of the controller RAM (~30 KB).
+  esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+
+  // NOTE: Bluetooth is NOT started here. BT Classic + the mbedTLS handshake
+  // don't fit in RAM together (BIGNUM OOM -16), so we connect the WSS relay
+  // first and only then start BT (see loop). If the relay drops later, the
+  // re-handshake would OOM with BT running — the loop reboots instead.
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
@@ -212,11 +218,32 @@ void setup() {
   ws.enableHeartbeat(15000, 5000, 3);
 }
 
+static bool btUp = false;
+static uint32_t relayDownSince = 0;
+
 void loop() {
   ws.loop();
 
-  printerConnected = bt.connected();
-  if (!printerConnected && millis() - lastPrinterAttempt > 15000) {
+  // Start Bluetooth only after the TLS websocket is established (see setup).
+  if (!btUp && ws.isConnected()) {
+    Serial.printf("Relay up, starting Bluetooth (heap %u)\n", ESP.getFreeHeap());
+    bt.begin("ESP32-PrintBridge", true); // true = master (we connect out)
+    bt.setPin(PRINTER_PIN);
+    btUp = true;
+  }
+
+  // With BT running the TLS re-handshake can't allocate — reboot to recover.
+  if (btUp) {
+    if (ws.isConnected()) relayDownSince = 0;
+    else if (!relayDownSince) relayDownSince = millis();
+    else if (millis() - relayDownSince > 60000) {
+      Serial.println("Relay down >60s with BT active, rebooting");
+      ESP.restart();
+    }
+  }
+
+  printerConnected = btUp && bt.connected();
+  if (btUp && !printerConnected && millis() - lastPrinterAttempt > 15000) {
     lastPrinterAttempt = millis();
     printerConnected = connectPrinter();
   }
