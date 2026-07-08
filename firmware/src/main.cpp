@@ -272,11 +272,10 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   // Battery-bank friendly: cap radio TX power (full-power join bursts spike
-  // ~500 mA and brown out weak USB sources — the "stuck joining" symptom),
-  // and disable modem sleep (steadier ~100 mA draw also keeps power banks
-  // from auto-shutting off on "no load").
+  // ~500 mA and brown out weak USB sources — the "stuck joining" symptom).
+  // Do NOT WiFi.setSleep(false): BT Classic shares the radio and its
+  // controller abort()s at init without WiFi modem sleep (coexistence).
   WiFi.setTxPower(WIFI_POWER_11dBm);
-  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi connecting");
   uint32_t wifiStart = millis(), lastKick = millis();
