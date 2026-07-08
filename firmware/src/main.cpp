@@ -271,6 +271,12 @@ void setup() {
   // re-handshake would OOM with BT running — the loop reboots instead.
 
   WiFi.mode(WIFI_STA);
+  // Battery-bank friendly: cap radio TX power (full-power join bursts spike
+  // ~500 mA and brown out weak USB sources — the "stuck joining" symptom),
+  // and disable modem sleep (steadier ~100 mA draw also keeps power banks
+  // from auto-shutting off on "no load").
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("WiFi connecting");
   uint32_t wifiStart = millis(), lastKick = millis();
