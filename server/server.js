@@ -23,7 +23,8 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
 const WIDTH_DOTS = 384;
 const WIDTH_BYTES = WIDTH_DOTS / 8;
 const MAX_HEIGHT = 400;           // rows (~5 cm of paper — public page, save the roll)
-const MAX_QUEUE = 10;
+const MAX_QUEUE = 50;               // the printer PC can be off for hours — hold a real backlog
+const QUEUE_FILE = process.env.QUEUE_FILE || ''; // set to persist the queue across restarts
 const JOB_TIMEOUT_MS = 180_000; // max-length job + slow-burn pauses can near 2 min
 const RATE_LIMIT = { windowMs: 60_000, max: 3 }; // per IP: 3 prints/minute
 
@@ -74,6 +75,31 @@ let active = null;            // job currently at the printer
 let nextId = 1;
 const jobStates = new Map();  // id -> 'queued'|'printing'|'done'|'error:msg'
 
+// ---- queue persistence ----
+// The PC that owns the printer sleeps for hours at a time; jobs wait here
+// meanwhile, so they must also survive relay restarts. The active job is
+// snapshotted too — after a crash mid-print a duplicate beats a lost print.
+function saveQueue() {
+  if (!QUEUE_FILE) return;
+  const jobs = (active ? [active, ...queue] : queue)
+    .map(j => ({ id: j.id, height: j.height, bits: j.bits.toString('base64') }));
+  try {
+    fs.writeFileSync(QUEUE_FILE + '.tmp', JSON.stringify({ nextId, jobs }));
+    fs.renameSync(QUEUE_FILE + '.tmp', QUEUE_FILE);
+  } catch (e) { console.error('queue save failed:', e.message); }
+}
+function loadQueue() {
+  if (!QUEUE_FILE || !fs.existsSync(QUEUE_FILE)) return;
+  try {
+    const saved = JSON.parse(fs.readFileSync(QUEUE_FILE, 'utf8'));
+    nextId = saved.nextId || 1;
+    queue = saved.jobs.map(j => ({ id: j.id, height: j.height, bits: Buffer.from(j.bits, 'base64') }));
+    for (const j of queue) jobStates.set(j.id, 'queued');
+    if (queue.length) console.log(`restored ${queue.length} queued job(s)`);
+  } catch (e) { console.error('queue load failed:', e.message); }
+}
+loadQueue();
+
 // Jobs are streamed as stripe-sized binary chunks (the ESP32's websocket
 // library chokes on large single frames). Each chunk reuses the same header
 // (widthBytes, rows-in-chunk, jobId); a {"type":"jobEnd"} text frame follows,
@@ -100,6 +126,7 @@ function pump() {
   active.timer = setTimeout(() => {
     jobStates.set(active.id, 'error: timeout');
     active = null;
+    saveQueue();
     pump();
   }, JOB_TIMEOUT_MS);
 }
@@ -109,6 +136,7 @@ function finishActive(ok, message) {
   clearTimeout(active.timer);
   jobStates.set(active.id, ok ? 'done' : `error: ${message || 'print failed'}`);
   active = null;
+  saveQueue();
   pump();
 }
 
@@ -152,6 +180,7 @@ app.post('/api/print', (req, res) => {
     for (const k of jobStates.keys()) { if (jobStates.size <= 100) break; jobStates.delete(k); }
   }
   console.log(`[job ${id}] queued from ${ip}, ${height} rows`);
+  saveQueue();
   pump();
   res.json({ id, queued: true });
 });
@@ -195,6 +224,7 @@ wss.on('connection', (ws, req) => {
       } else {
         jobStates.set(job.id, 'error: bridge disconnected');
       }
+      saveQueue();
     }
     console.log('ESP32 bridge disconnected');
   });
