@@ -207,6 +207,24 @@ wss.on('connection', (ws, req) => {
     if (m.type === 'status') { deviceStatus = m; pump(); } // printer may have just come back
     else if (m.type === 'done' && active && m.id === active.id) finishActive(true);
     else if (m.type === 'error' && active && m.id === active.id) finishActive(false, m.message);
+    else if (m.type === 'requeue' && active && m.id === active.id) {
+      // the printer vanished under the bridge mid-job: hold the job for its
+      // return instead of guessing it printed. Cap reprints in case a dying
+      // battery makes it flap mid-job forever.
+      clearTimeout(active.timer);
+      const job = active;
+      active = null;
+      deviceStatus.printer = false; // don't redispatch until a status says otherwise
+      job.requeues = (job.requeues || 0) + 1;
+      if (job.requeues > 5) {
+        jobStates.set(job.id, 'error: printer kept dropping mid-print');
+      } else {
+        jobStates.set(job.id, 'queued');
+        queue.unshift(job);
+        console.log(`[job ${job.id}] printer offline at the bridge, requeued`);
+      }
+      saveQueue();
+    }
   });
 
   ws.on('close', () => {

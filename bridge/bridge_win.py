@@ -7,15 +7,22 @@ Bluetooth SPP virtual COM port Windows creates after pairing. While this PC
 is off the relay queues jobs (persisted to disk); the moment this bridge
 comes up, the backlog prints.
 
+Liveness is proven, never assumed: Windows happily buffers COM writes to a
+printer that has powered off, so a write "succeeding" means nothing. The
+only trustworthy signal is a DLE EOT 1 status query answered with a real
+byte from the printer. We probe while idle and after every job; a job whose
+probe fails is handed back to the relay with {"type":"requeue"} so it prints
+when the printer returns, instead of being falsely acked done.
+
 Job protocol (must match server.js):
   - Relay streams a job as binary chunks:
       [0..1] uint16 LE widthBytes (48)
       [2..3] uint16 LE rows in this chunk
-      [4..7] uint32 LE jobId
+      [4..7] uint32 LE uint32 jobId
       [8.. ] widthBytes*rows bitmap bytes
   - Then a text frame {"type":"jobEnd","id":N}.
   - Each chunk prints as a GS v 0 raster block; feed is blank raster rows
-    (the MPT-II ignores ESC d); ack {"type":"done"|"error","id":N,...}.
+    (the MPT-II ignores ESC d); ack {"type":"done"|"error"|"requeue","id":N}.
   - {"type":"status","printer":bool} goes up every few seconds; the relay
     only dispatches jobs while printer=true.
 """
@@ -33,14 +40,15 @@ import websockets
 
 RELAY_WS = "ws://100.101.116.82:8377/device"   # kohzuhserver over Tailscale
 DEVICE_TOKEN = "dc7526dc476bd7f63be54cdbceb82d74afaf2cb739d26ed6"
-PRINTER_BT_MAC = ""       # set after pairing, e.g. "0012F31A5E8C" (no colons);
-                          # empty = first Bluetooth SPP port with a remote MAC
+PRINTER_BT_MAC = ""       # e.g. "86677ABC30CC" (no colons); empty = first
+                          # Bluetooth SPP port with a remote MAC in its hwid
 
 WIDTH_BYTES = 48
 FEED_RASTER_ROWS = 40     # ~0.5 cm tail so the print clears the head
-BT_WRITE_CHUNK = 256      # pace SPP like the ESP32 did; printer buffer is small
+BT_WRITE_CHUNK = 256      # pace SPP; printer buffer is small
 BT_WRITE_DELAY = 0.03
 STATUS_INTERVAL = 5
+PROBE_TIMEOUT = 3         # seconds to wait for the DLE EOT status byte
 
 log = logging.getLogger("bridge")
 logging.basicConfig(
@@ -67,15 +75,37 @@ def find_printer_port():
     return None
 
 
+def probe():
+    """DLE EOT 1: ask the printer for its status byte. A response can only
+    come from a live, connected printer — buffers can't counterfeit it."""
+    try:
+        printer.reset_input_buffer()
+        printer.write(b"\x10\x04\x01")
+        printer.flush()
+        end = time.time() + PROBE_TIMEOUT
+        while time.time() < end:
+            if printer.in_waiting:
+                printer.read(printer.in_waiting)
+                return True
+            time.sleep(0.05)
+        return False
+    except Exception:
+        return False
+
+
 def printer_connect():
     global printer
     port = find_printer_port()
     if not port:
         raise OSError("no Bluetooth SPP COM port found (printer paired?)")
-    s = serial.Serial(port, 115200, timeout=10, write_timeout=15)
-    s.write(b"\x1b\x40")  # ESC @ init — also proves the BT link is really up
+    s = serial.Serial(port, 115200, timeout=5, write_timeout=15)
+    s.write(b"\x1b\x40")  # ESC @ init
     s.flush()
     printer = s
+    if not probe():       # opening a BT COM port can succeed with nobody home
+        printer = None
+        s.close()
+        raise OSError("port opened but printer did not answer status query")
     log.info(f"printer connected on {port}")
 
 
@@ -112,28 +142,19 @@ def feed_paper():
     printer_write_all(hdr + bytes(WIDTH_BYTES * FEED_RASTER_ROWS))
 
 
-def printer_alive():
-    """Cheap link probe while idle: a NUL byte is a no-op for ESC/POS."""
-    if printer is None:
-        return False
-    try:
-        printer.write(b"\x00")
-        printer.flush()
-        return True
-    except Exception as e:
-        log.info(f"printer link lost: {e}")
-        printer_close()
-        return False
-
-
 async def bridge():
-    failed_job = 0
+    failed_job = 0    # real error (bad dimensions) — relay should mark it failed
+    requeue_job = 0   # printer trouble — relay should put it back in the queue
     printing = False
 
     async with websockets.connect(f"{RELAY_WS}?token={DEVICE_TOKEN}",
                                   ping_interval=20, ping_timeout=20,
                                   max_size=2**22) as ws:
         log.info("relay connected")
+
+        async def send_status():
+            await ws.send(json.dumps({"type": "status",
+                                      "printer": printer is not None}))
 
         async def status_loop():
             while True:
@@ -142,11 +163,11 @@ async def bridge():
                         await asyncio.to_thread(printer_connect)
                     except Exception as e:
                         log.info(f"printer connect failed: {e}")
-                        printer_close()
                 elif not printing:
-                    await asyncio.to_thread(printer_alive)
-                await ws.send(json.dumps({"type": "status",
-                                          "printer": printer is not None}))
+                    if not await asyncio.to_thread(probe):
+                        log.info("printer stopped answering, marking offline")
+                        printer_close()
+                await send_status()
                 await asyncio.sleep(STATUS_INTERVAL)
 
         status_task = asyncio.create_task(status_loop())
@@ -158,13 +179,13 @@ async def bridge():
                     width = msg[0] | (msg[1] << 8)
                     rows = msg[2] | (msg[3] << 8)
                     job_id = int.from_bytes(msg[4:8], "little")
-                    if job_id == failed_job:
+                    if job_id in (failed_job, requeue_job):
                         continue
                     if width != WIDTH_BYTES or len(msg) - 8 != width * rows:
                         failed_job = job_id
                         continue
                     if printer is None:
-                        failed_job = job_id
+                        requeue_job = job_id
                         continue
                     printing = True
                     try:
@@ -172,24 +193,36 @@ async def bridge():
                     except Exception as e:
                         log.info(f"print write failed: {e}")
                         printer_close()
-                        failed_job = job_id
+                        requeue_job = job_id
                 else:
                     m = json.loads(msg)
                     if m.get("type") == "jobEnd":
                         job_id = m["id"]
-                        if job_id == failed_job or printer is None:
+                        if job_id == failed_job:
                             reply = {"type": "error", "id": job_id,
-                                     "message": "printer offline or write failed"}
+                                     "message": "bad job data"}
+                        elif job_id == requeue_job or printer is None:
+                            reply = {"type": "requeue", "id": job_id}
+                            log.info(f"job {job_id} handed back (printer offline)")
                         else:
                             try:
                                 await asyncio.to_thread(feed_paper)
+                            except Exception as e:
+                                log.info(f"feed write failed: {e}")
+                            # the verdict: did the printer live through the job?
+                            if await asyncio.to_thread(probe):
                                 reply = {"type": "done", "id": job_id}
                                 log.info(f"job {job_id} done")
-                            except Exception as e:
+                            else:
+                                log.info(f"job {job_id} unconfirmed — printer "
+                                         "gone, handing back for reprint")
                                 printer_close()
-                                reply = {"type": "error", "id": job_id,
-                                         "message": f"feed failed: {e}"}
+                                reply = {"type": "requeue", "id": job_id}
                         printing = False
+                        # forget this id: when the relay re-dispatches the
+                        # requeued job it must print, not be skipped again
+                        failed_job = requeue_job = 0
+                        await send_status()   # printer=false halts dispatch now
                         await ws.send(json.dumps(reply))
         finally:
             status_task.cancel()
