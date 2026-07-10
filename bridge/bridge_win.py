@@ -48,7 +48,12 @@ FEED_RASTER_ROWS = 40     # ~0.5 cm tail so the print clears the head
 BT_WRITE_CHUNK = 256      # pace SPP; printer buffer is small
 BT_WRITE_DELAY = 0.03
 STATUS_INTERVAL = 5
-PROBE_TIMEOUT = 3         # seconds to wait for the DLE EOT status byte
+PROBE_TIMEOUT = 3         # idle probe: an idle printer answers in well under a second
+# The MPT-II answers DLE EOT in-line, BEHIND buffered raster data — after a
+# job the status byte only arrives once the head finishes printing. So the
+# post-job probe must outwait the mechanics (a full 400-row job takes ~10 s;
+# generous margin for a cold, slow head).
+JOB_PROBE_TIMEOUT = 45
 
 log = logging.getLogger("bridge")
 logging.basicConfig(
@@ -75,14 +80,16 @@ def find_printer_port():
     return None
 
 
-def probe():
+def probe(timeout=PROBE_TIMEOUT):
     """DLE EOT 1: ask the printer for its status byte. A response can only
-    come from a live, connected printer — buffers can't counterfeit it."""
+    come from a live, connected printer — buffers can't counterfeit it. This
+    printer processes the query in-line, so the answer doubles as proof that
+    everything sent before it has been fully digested."""
     try:
         printer.reset_input_buffer()
         printer.write(b"\x10\x04\x01")
         printer.flush()
-        end = time.time() + PROBE_TIMEOUT
+        end = time.time() + timeout
         while time.time() < end:
             if printer.in_waiting:
                 printer.read(printer.in_waiting)
@@ -209,8 +216,9 @@ async def bridge():
                                 await asyncio.to_thread(feed_paper)
                             except Exception as e:
                                 log.info(f"feed write failed: {e}")
-                            # the verdict: did the printer live through the job?
-                            if await asyncio.to_thread(probe):
+                            # the verdict: the status byte only arrives after
+                            # the head finishes, so this outwaits the mechanics
+                            if await asyncio.to_thread(probe, JOB_PROBE_TIMEOUT):
                                 reply = {"type": "done", "id": job_id}
                                 log.info(f"job {job_id} done")
                             else:
