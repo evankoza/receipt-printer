@@ -30,6 +30,7 @@ Job protocol (must match server.js):
 import asyncio
 import json
 import logging
+import threading
 import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -65,6 +66,7 @@ logging.basicConfig(
 )
 
 printer = None            # open serial.Serial or None
+serial_lock = threading.Lock()  # probes and job writes must never interleave
 
 
 def find_printer_port():
@@ -82,20 +84,24 @@ def find_printer_port():
 
 def probe(timeout=PROBE_TIMEOUT):
     """DLE EOT 1: ask the printer for its status byte. A response can only
-    come from a live, connected printer — buffers can't counterfeit it. This
-    printer processes the query in-line, so the answer doubles as proof that
-    everything sent before it has been fully digested."""
+    come from a live, connected printer — buffers can't counterfeit it.
+    Measured quirk: a query landing while the head is busy is DISCARDED, not
+    queued — so re-ask every couple of seconds instead of asking once. The
+    first answered query after a job doubles as proof the job was digested."""
     try:
-        printer.reset_input_buffer()
-        printer.write(b"\x10\x04\x01")
-        printer.flush()
-        end = time.time() + timeout
-        while time.time() < end:
-            if printer.in_waiting:
-                printer.read(printer.in_waiting)
-                return True
-            time.sleep(0.05)
-        return False
+        with serial_lock:
+            end = time.time() + timeout
+            while time.time() < end:
+                printer.reset_input_buffer()
+                printer.write(b"\x10\x04\x01")
+                printer.flush()
+                attempt_end = min(time.time() + 2, end)
+                while time.time() < attempt_end:
+                    if printer.in_waiting:
+                        printer.read(printer.in_waiting)
+                        return True
+                    time.sleep(0.05)
+            return False
     except Exception:
         return False
 
@@ -127,12 +133,13 @@ def printer_close():
 
 
 def printer_write_all(data: bytes):
-    view = memoryview(data)
-    while view:
-        printer.write(view[:BT_WRITE_CHUNK])
-        printer.flush()
-        view = view[BT_WRITE_CHUNK:]
-        time.sleep(BT_WRITE_DELAY)
+    with serial_lock:
+        view = memoryview(data)
+        while view:
+            printer.write(view[:BT_WRITE_CHUNK])
+            printer.flush()
+            view = view[BT_WRITE_CHUNK:]
+            time.sleep(BT_WRITE_DELAY)
 
 
 def print_chunk(rows: int, bits: bytes):
