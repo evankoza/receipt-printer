@@ -100,6 +100,30 @@
   #paperGrip:hover { color: var(--accent); border-color: var(--accent); }
   #msg { min-height: 18px; font-size: 13px; color: var(--muted); }
   #msg.err { color: #ff7a7a; } #msg.ok { color: #5ad66f; }
+  /* a repeat print isn't a failure, so it gets the accent, not the red */
+  #msg.warn { color: var(--accent); }
+
+  /* ── "who are you?" prompt ──
+     Fires on every print. Whatever they type is appended to their own
+     receipt, so it comes off the roll attached to the thing they made. */
+  #helloDlg {
+    margin: auto; padding: 0; border: 1px solid var(--border); border-radius: 12px;
+    background: var(--panel); color: var(--text);
+    width: min(430px, calc(100vw - 28px));
+    box-shadow: 0 18px 50px rgba(0, 0, 0, .5);
+  }
+  #helloDlg::backdrop { background: rgba(0, 0, 0, .55); }
+  #helloDlg form { padding: 18px 18px 16px; }
+  #helloDlg h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .12em;
+    color: var(--accent); margin: 0 0 10px; font-weight: 600;
+  }
+  #helloDlg p.copy { font-size: 15px; margin: 0 0 12px; }
+  #helloDlg textarea { margin-bottom: 14px; }
+  .helloBtns { display: flex; gap: 10px; align-items: center; }
+  .helloBtns button.primary { width: auto; flex: 1; }
+  /* skip sits on the left, but the primary is first in the DOM so Enter picks it */
+  .helloBtns button.ghost { order: -1; background: transparent; color: var(--muted); }
   #offlineNote {
     font-size: 13px; color: var(--accent); background: rgba(255, 180, 84, .08);
     border: 1px solid rgba(255, 180, 84, .35); border-radius: 6px;
@@ -197,6 +221,21 @@
     </section>
   </div>
 </main>
+
+<!-- A receipt arrives here with no idea who sent it; this is the only chance
+     to ask. Skippable in one click, and the answer only ever hits paper. -->
+<dialog id="helloDlg">
+  <form method="dialog">
+    <h2>Optional — before it prints</h2>
+    <p class="copy">Now, you know me, but I don't know you… Feel free to give me a way to contact you!</p>
+    <textarea id="helloText" rows="2" maxlength="120"
+              placeholder="email, @handle, a name — anything you like"></textarea>
+    <div class="helloBtns">
+      <button id="helloSend" value="send" class="primary">Add it &amp; print</button>
+      <button id="helloSkip" value="skip" class="ghost">Just print</button>
+    </div>
+  </form>
+</dialog>
 
 <script src="app.js"></script>
 </body>

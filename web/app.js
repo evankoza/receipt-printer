@@ -436,15 +436,15 @@ function startResize(e) {
 }
 
 window.addEventListener('keydown', e => {
-  if ((e.key === 'Delete' || e.key === 'Backspace') && selected &&
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selected && !helloDlg.open &&
       !['TEXTAREA', 'INPUT'].includes(document.activeElement.tagName)) {
     deleteSelected();
   }
 });
 
 // ---------- printing ----------
-function packBits(bits) {
-  const bytes = new Uint8Array((W / 8) * paperH);
+function packBits(bits, h) {
+  const bytes = new Uint8Array((W / 8) * h);
   for (let i = 0; i < bits.length; i++)
     if (bits[i]) bytes[i >> 3] |= 0x80 >> (i & 7);
   let bin = '';
@@ -456,8 +456,111 @@ function packBits(bits) {
 const msg = $('msg');
 function setMsg(text, cls = '') { msg.textContent = text; msg.className = cls; }
 
+// ---------- "now, you know me, but I don't know you" ----------
+// The relay logs nothing but an IP, so this is the only way a print ever comes
+// with a name attached. It's drawn on its own strip with a plain threshold:
+// the dither/brightness/invert knobs belong to the visitor's artwork, and
+// running an email address through Halftone (or Invert) makes it unreadable.
+const helloDlg = $('helloDlg');
+const helloText = $('helloText');
+let lastHello = '';   // remembered per tab, so a second print is one click
+let lastSent = null;  // base64 of the last accepted job — see the dupe check below
+
+function askHello() {
+  if (typeof helloDlg.showModal !== 'function') return Promise.resolve(''); // no <dialog>: just print
+  helloText.value = lastHello;
+  helloDlg.showModal();
+  helloText.focus();
+  return new Promise(resolve => {
+    // Resolve off the buttons (and Esc) rather than the dialog's `close`
+    // event: a print that never sends because one event didn't land is a
+    // much worse bug than an extra listener. First one wins; the rest are
+    // dropped with the AbortController.
+    const ac = new AbortController();
+    const opt = { signal: ac.signal };
+    const done = send => {
+      ac.abort();
+      lastHello = helloText.value;
+      if (helloDlg.open) helloDlg.close();
+      resolve(send ? helloText.value.trim() : '');
+    };
+    // preventDefault so the form's own method=dialog submit doesn't ALSO
+    // close the dialog: two closes for one click leaves it unable to reopen.
+    $('helloSend').addEventListener('click', e => { e.preventDefault(); done(true); }, opt);
+    $('helloSkip').addEventListener('click', e => { e.preventDefault(); done(false); }, opt);
+    helloDlg.addEventListener('cancel', () => done(false), opt);   // Esc
+    helloDlg.addEventListener('close', () => done(helloDlg.returnValue === 'send'), opt);
+  });
+}
+
+const NOTE = { pad: 12, size: 20, label: 13, ruleTop: 14, ruleH: 2, gap: 10, lead: 6 };
+
+function wrapMono(ctx, text, maxW) {
+  const out = [];
+  for (const para of text.split('\n')) {
+    let line = '';
+    for (let word of para.split(/\s+/).filter(Boolean)) {
+      // a long email never fits 384px — break it mid-word instead of letting
+      // it run off the edge of the paper
+      while (ctx.measureText(word).width > maxW) {
+        let cut = word.length;
+        while (cut > 1 && ctx.measureText(word.slice(0, cut)).width > maxW) cut--;
+        if (line) { out.push(line); line = ''; }
+        out.push(word.slice(0, cut));
+        word = word.slice(cut);
+      }
+      const probe = line ? `${line} ${word}` : word;
+      if (line && ctx.measureText(probe).width > maxW) { out.push(line); line = word; }
+      else line = probe;
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+// Returns { bits, h }: a 1-bit strip the same 384px width as the receipt.
+function renderHelloBits(text) {
+  const c = document.createElement('canvas');
+  c.width = W;
+  const x = c.getContext('2d', { willReadFrequently: true });
+  x.font = `${NOTE.size}px monospace`;
+  const lines = wrapMono(x, text, W - NOTE.pad * 2);
+  const lineH = Math.round(NOTE.size * 1.3);
+  const h = Math.ceil((NOTE.ruleTop + NOTE.ruleH + NOTE.gap + NOTE.label + NOTE.lead
+                       + lines.length * lineH + NOTE.pad) / 8) * 8;
+
+  c.height = h;   // resizing the canvas clears the context, so restyle after
+  x.fillStyle = '#fff'; x.fillRect(0, 0, W, h);
+  x.fillStyle = '#000';
+  x.fillRect(NOTE.pad, NOTE.ruleTop, W - NOTE.pad * 2, NOTE.ruleH);
+  x.textBaseline = 'top';
+  let y = NOTE.ruleTop + NOTE.ruleH + NOTE.gap;
+  x.font = `bold ${NOTE.label}px monospace`;
+  x.fillText('REACH ME AT', NOTE.pad, y);
+  y += NOTE.label + NOTE.lead;
+  x.font = `${NOTE.size}px monospace`;
+  for (const line of lines) { x.fillText(line, NOTE.pad, y); y += lineH; }
+
+  const d = x.getImageData(0, 0, W, h).data;
+  const bits = new Uint8Array(W * h);
+  for (let i = 0; i < bits.length; i++) bits[i] = d[i * 4] < 128 ? 1 : 0;
+  return { bits, h };
+}
+
+async function postJob(data, height) {
+  const res = await fetch(`${RELAY_URL}/api/print`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ width: W, height, data }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+  return body;
+}
+
 $('printBtn').addEventListener('click', async () => {
   const btn = $('printBtn');
+  const hello = await askHello();
   btn.disabled = true;
   setMsg('Sending…');
   try {
@@ -466,13 +569,38 @@ $('printBtn').addEventListener('click', async () => {
     fitPaper();
     const bits = ditherToBits();   // synchronous, uses the fitted paperH
     latestBits = bits;
-    const res = await fetch(`${RELAY_URL}/api/print`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ width: W, height: paperH, data: packBits(bits) }),
-    });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
+
+    // One job wherever it fits: the footer then tears off still attached to
+    // their receipt, and it costs a single slot of the relay's 3/minute.
+    let out = bits, height = paperH, tail = null;
+    if (hello) {
+      const note = renderHelloBits(hello);
+      if (paperH + note.h <= MAX_H) {
+        out = new Uint8Array(W * (paperH + note.h));
+        out.set(bits, 0);
+        out.set(note.bits, W * paperH);
+        height = paperH + note.h;
+      } else {
+        tail = note;   // receipt is already at the height cap — send it after
+      }
+    }
+
+    // Hammering the button sends the identical bitmap two or three times and
+    // burns the roll on copies nobody wanted. Compare what we're about to
+    // send against what we last sent: any edit at all — or a different note
+    // in the box above — changes these bytes, so this only catches a true
+    // repeat. Guidance, not enforcement; the relay is still the real limit.
+    const data = packBits(out, height);
+    if (data === lastSent) {
+      setMsg('Already got that one — try making some changes before sending it again.', 'warn');
+      return;
+    }
+
+    const body = await postJob(data, height);
+    // The receipt is away; a footer the relay turns down (rate limit) isn't
+    // worth reporting as a failed print.
+    if (tail) await postJob(packBits(tail.bits, tail.h), tail.h).catch(() => {});
+    lastSent = data;   // only after it lands, so a failed send can be retried
     setMsg('Queued! Watching printer…', 'ok');
     await watchJob(body.id);
   } catch (err) {
