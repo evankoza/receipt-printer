@@ -16,6 +16,9 @@ import { fileURLToPath } from 'url';
 
 const PORT = process.env.PORT || 8377;
 const DEVICE_TOKEN = process.env.DEVICE_TOKEN || 'CHANGE_ME_LONG_RANDOM_STRING';
+// Services on this box (class-printer) send `Authorization: Bearer <token>` to
+// skip the public rate limit and to cancel their own still-queued jobs.
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || '';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   'https://evankoza.com,https://www.evankoza.com,http://localhost:8000,http://127.0.0.1:8000'
 ).split(',').map(s => s.trim());
@@ -23,6 +26,11 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
 const WIDTH_DOTS = 384;
 const WIDTH_BYTES = WIDTH_DOTS / 8;
 const MAX_HEIGHT = 400;           // rows (~5 cm of paper — public page, save the roll)
+// internal jobs (class-printer digest) go as one job instead of 400-row slices
+// with a pause + paper feed between each; ~30 s at the head, inside the
+// bridge's 45 s post-job probe window
+const MAX_HEIGHT_INTERNAL = 1200;
+const MAX_NOTE_HEIGHT = 120;      // the visitor's contact line, printed in the header
 const MAX_QUEUE = 50;               // the printer PC can be off for hours — hold a real backlog
 const QUEUE_FILE = process.env.QUEUE_FILE || ''; // set to persist the queue across restarts
 const JOB_TIMEOUT_MS = 180_000; // max-length job + slow-burn pauses can near 2 min
@@ -66,6 +74,82 @@ setInterval(() => { // prune
     if (keep.length) hits.set(ip, keep); else hits.delete(ip);
   }
 }, 60_000).unref();
+
+function isInternal(req) {
+  const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+  return !!(INTERNAL_TOKEN && m && m[1].length === INTERNAL_TOKEN.length &&
+    crypto.timingSafeEqual(Buffer.from(m[1]), Buffer.from(INTERNAL_TOKEN)));
+}
+
+// ---- visitor tag: who sent this print ----
+// Every public print gets a header naming its sender with a stable nickname
+// (BRAVE-OTTER), so repeat printers are recognisable without putting an IP
+// on paper. The nickname is a keyed hash of the address — the same visitor
+// always gets the same name, and a name can't be turned back into an IP.
+// IPv6 is keyed on its /64, which stays put while the rest rotates.
+const NICK_KEY = process.env.NICK_KEY || DEVICE_TOKEN;
+const ADJ = ['AMBER', 'BRAVE', 'CALM', 'DAPPER', 'EAGER', 'FUZZY', 'GENTLE', 'HAPPY', 'ICY',
+  'JOLLY', 'KEEN', 'LUCKY', 'MELLOW', 'NIMBLE', 'ODD', 'PLUCKY', 'QUIET', 'RUSTY', 'SLY',
+  'TIDY', 'UPBEAT', 'VIVID', 'WITTY', 'ZESTY', 'BOLD', 'COSY', 'DIZZY', 'FANCY', 'GRUMPY',
+  'HUMBLE', 'JUMPY', 'LOFTY', 'MIGHTY', 'NOBLE', 'PERKY', 'ROWDY', 'SUNNY', 'TINY', 'WILD', 'SPICY'];
+const ANIMAL = ['OTTER', 'BADGER', 'FALCON', 'GECKO', 'HERON', 'IBIS', 'JACKAL', 'KOALA', 'LEMUR',
+  'MOOSE', 'NEWT', 'OWL', 'PANDA', 'QUAIL', 'RAVEN', 'SLOTH', 'TAPIR', 'VOLE', 'WALRUS', 'YAK',
+  'BEAVER', 'CRANE', 'DINGO', 'EGRET', 'FERRET', 'GOOSE', 'HYENA', 'IGUANA', 'LYNX', 'MOLE',
+  'NARWHAL', 'OCELOT', 'PUFFIN', 'RACCOON', 'SQUID', 'TOUCAN', 'WOMBAT', 'BISON', 'COYOTE', 'MINK'];
+
+function visitorKey(ip) {
+  const a = String(ip || '').replace(/^::ffff:/, '');
+  return a.includes(':') ? a.split(':').slice(0, 4).join(':') + '::/64' : a;
+}
+function nickname(ip) {
+  const h = crypto.createHmac('sha256', NICK_KEY).update(visitorKey(ip)).digest();
+  return `${ADJ[h.readUInt16BE(0) % ADJ.length]}-${ANIMAL[h.readUInt16BE(2) % ANIMAL.length]}`;
+}
+
+// 5x7 bitmap font, drawn at 2x. Only what nicknames need.
+const FONT = {
+  A: '01110100011000111111100011000110001', B: '11110100011000111110100011000111110',
+  C: '01110100011000010000100001000101110', D: '11110100011000110001100011000111110',
+  E: '11111100001000011110100001000011111', F: '11111100001000011110100001000010000',
+  G: '01110100011000010111100011000101111', H: '10001100011000111111100011000110001',
+  I: '01110001000010000100001000010001110', J: '00111000100001000010000101001001100',
+  K: '10001100101010011000101001001010001', L: '10000100001000010000100001000011111',
+  M: '10001110111010110101100011000110001', N: '10001100011100110101100111000110001',
+  O: '01110100011000110001100011000101110', P: '11110100011000111110100001000010000',
+  Q: '01110100011000110001101011001001101', R: '11110100011000111110101001001010001',
+  S: '01111100001000001110000010000111110', T: '11111001000010000100001000010000100',
+  U: '10001100011000110001100011000101110', V: '10001100011000110001100010101000100',
+  W: '10001100011000110101101011010101010', X: '10001100010101000100010101000110001',
+  Y: '10001100010101000100001000010000100', Z: '11111000010001000100010001000011111',
+  '-': '00000000000000011111000000000000000', ' ': '00000000000000000000000000000000000',
+  ':': '00000011000110000000011000110000000',
+};
+const SCALE = 2, CHAR_W = 5 * SCALE + SCALE, LINE_H = 7 * SCALE;
+
+// One centred line of text as 1-bit rows (1 = burn), `pad` blank rows above and below.
+function textRows(text, pad = 4) {
+  const rows = LINE_H + pad * 2;
+  const buf = Buffer.alloc(WIDTH_BYTES * rows);
+  const chars = [...text.toUpperCase()].filter(c => FONT[c]);
+  let x = Math.max(0, Math.floor((WIDTH_DOTS - chars.length * CHAR_W + SCALE) / 2));
+  for (const c of chars) {
+    const g = FONT[c];
+    for (let gy = 0; gy < 7; gy++) for (let gx = 0; gx < 5; gx++) {
+      if (g[gy * 5 + gx] !== '1') continue;
+      for (let sy = 0; sy < SCALE; sy++) for (let sx = 0; sx < SCALE; sx++) {
+        const px = x + gx * SCALE + sx, py = pad + gy * SCALE + sy;
+        if (px < WIDTH_DOTS) buf[py * WIDTH_BYTES + (px >> 3)] |= 0x80 >> (px & 7);
+      }
+    }
+    x += CHAR_W;
+  }
+  return buf;
+}
+function ruleRows() { // 2-row line with a little air under it, between header and design
+  const buf = Buffer.alloc(WIDTH_BYTES * 8);
+  buf.fill(0xff, WIDTH_BYTES * 1, WIDTH_BYTES * 3);
+  return buf;
+}
 
 // ---- job queue / device link ----
 let device = null;            // ws connection from ESP32
@@ -155,31 +239,67 @@ app.get('/api/job/:id', (req, res) => {
   res.json({ state });
 });
 
+// internal only: drop a job that hasn't reached the printer yet
+app.delete('/api/job/:id', (req, res) => {
+  if (!isInternal(req)) return res.status(403).json({ error: 'forbidden' });
+  const id = Number(req.params.id);
+  const i = queue.findIndex(j => j.id === id);
+  if (i < 0) return res.status(409).json({ error: 'not queued', state: jobStates.get(id) || null });
+  queue.splice(i, 1);
+  jobStates.set(id, 'cancelled');
+  console.log(`[job ${id}] cancelled`);
+  saveQueue();
+  res.json({ id, cancelled: true });
+});
+
 app.post('/api/print', (req, res) => {
   const ip = req.ip;
-  if (rateLimited(ip)) return res.status(429).json({ error: 'Rate limit: 3 prints per minute. Chill :)' });
+  const internal = isInternal(req);
+  const nick = internal ? null : nickname(ip);
+  const reject = (code, error) => {
+    console.log(`[rejected] ${nick || 'internal'} (${ip}): ${error}`);
+    return res.status(code).json({ error });
+  };
+  if (!internal && rateLimited(ip)) return reject(429, 'Rate limit: 3 prints per minute. Chill :)');
 
-  const { width, height, data } = req.body || {};
-  if (width !== WIDTH_DOTS) return res.status(400).json({ error: `width must be ${WIDTH_DOTS}` });
-  if (!Number.isInteger(height) || height < 1 || height > MAX_HEIGHT)
-    return res.status(400).json({ error: `height must be 1..${MAX_HEIGHT}` });
+  const { width, height, data, note } = req.body || {};
+  const maxHeight = internal ? MAX_HEIGHT_INTERNAL : MAX_HEIGHT;
+  if (width !== WIDTH_DOTS) return reject(400, `width must be ${WIDTH_DOTS}`);
+  if (!Number.isInteger(height) || height < 1 || height > maxHeight)
+    return reject(400, `height must be 1..${maxHeight}`);
 
   let bits;
   try { bits = Buffer.from(data, 'base64'); } catch { bits = null; }
-  if (!bits || bits.length !== WIDTH_BYTES * height)
-    return res.status(400).json({ error: 'data length mismatch' });
+  if (!bits || bits.length !== WIDTH_BYTES * height) return reject(400, 'data length mismatch');
+
+  // optional contact line from the page, already rendered: {height, data}
+  let noteBits = null;
+  if (note) {
+    if (!Number.isInteger(note.height) || note.height < 1 || note.height > MAX_NOTE_HEIGHT)
+      return reject(400, `note height must be 1..${MAX_NOTE_HEIGHT}`);
+    try { noteBits = Buffer.from(note.data, 'base64'); } catch { noteBits = null; }
+    if (!noteBits || noteBits.length !== WIDTH_BYTES * note.height) return reject(400, 'note length mismatch');
+  }
+
+  // public prints: sender's nickname, then their contact line, then the design,
+  // all one job so it tears off as one receipt
+  let rows = height;
+  if (nick) {
+    bits = Buffer.concat([textRows(`FROM ${nick}`), ...(noteBits ? [noteBits] : []), ruleRows(), bits]);
+    rows = bits.length / WIDTH_BYTES;
+  }
 
   // bridge/printer offline is fine — jobs wait in the queue and print on return
   if (queue.length >= MAX_QUEUE)
     return res.status(503).json({ error: 'Queue full, try again shortly' });
 
   const id = nextId++;
-  queue.push({ id, bits, height });
+  queue.push({ id, bits, height: rows });
   jobStates.set(id, 'queued');
   if (jobStates.size > 200) { // prune old job records
     for (const k of jobStates.keys()) { if (jobStates.size <= 100) break; jobStates.delete(k); }
   }
-  console.log(`[job ${id}] queued from ${ip}, ${height} rows`);
+  console.log(`[job ${id}] queued from ${nick || 'internal'} (${ip}), ${rows} rows${noteBits ? ', with contact line' : ''}`);
   saveQueue();
   pump();
   res.json({ id, queued: true });
